@@ -1,0 +1,2 @@
+"use client";import { usePathname } from "next/navigation";import AdminSidebar from "@/components/admin/AdminSidebar";import AdminGuard from "@/components/admin/AdminGuard";
+export default function Layout({children}:{children:React.ReactNode}){const path=usePathname();if(path==="/admin/login"||path==="/admin/reset-password")return <>{children}</>;return <div className="admin-body"><AdminGuard><div className="admin-shell"><AdminSidebar/><main className="admin-main">{children}</main></div></AdminGuard></div>}

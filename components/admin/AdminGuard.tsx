@@ -1,0 +1,2 @@
+"use client";import { useEffect,useState } from "react";import { useRouter } from "next/navigation";import { createClient } from "@/lib/supabase/client";
+export default function AdminGuard({children}:{children:React.ReactNode}){const [ready,setReady]=useState(false);const router=useRouter();useEffect(()=>{const db=createClient();if(!db){setReady(true);return}db.auth.getUser().then(({data})=>{if(!data.user)router.replace("/admin/login");else setReady(true)})},[router]);if(!ready)return <div className="login-page">טוען את אזור הניהול…</div>;return children}
