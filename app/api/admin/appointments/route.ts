@@ -53,7 +53,7 @@ function normalizeTime(value: unknown) {
 }
 
 function timeToSeconds(value: string) {
-  const [hours, minutes, seconds = "0"] = value.split(":").map(Number);
+  const [hours, minutes, seconds = 0] = value.split(":").map(Number);
 
   if (
     Number.isNaN(hours) ||
