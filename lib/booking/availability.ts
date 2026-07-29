@@ -1,21 +1,17 @@
 import { createServerClient } from "@/lib/supabase/server";
 
-type OpenSlotLike = {
-  available_date: string;
+type AvailabilitySlotLike = {
+  slot_date: string;
   start_time: string;
+  end_time: string;
+  status: "available" | "blocked" | "booked" | "closed";
 };
 
 type AppointmentLike = {
   appointment_date: string;
   start_time: string;
   end_time: string;
-};
-
-type BlockedTimeLike = {
-  blocked_date: string;
-  start_time: string | null;
-  end_time: string | null;
-  is_full_day: boolean | null;
+  status?: string;
 };
 
 type ServiceLike = {
@@ -23,18 +19,140 @@ type ServiceLike = {
   duration_minutes: number;
 };
 
+function normalizeTime(value: string) {
+  return value.slice(0, 5);
+}
+
 function toMinutes(value: string) {
-  const [hours, minutes] = value.split(":").map(Number);
+  const [hours, minutes] = normalizeTime(value)
+    .split(":")
+    .map(Number);
+
   return hours * 60 + minutes;
 }
 
-function overlaps(startA: number, endA: number, startB: number, endB: number) {
+function overlaps(
+  startA: number,
+  endA: number,
+  startB: number,
+  endB: number
+) {
   return startA < endB && endA > startB;
 }
 
 function isPastSlot(date: string, time: string) {
-  const slot = new Date(`${date}T${time}:00`);
-  return slot.getTime() <= Date.now();
+  const slotDate = new Date(`${date}T${normalizeTime(time)}:00`);
+
+  return slotDate.getTime() <= Date.now();
+}
+
+/**
+ * בודק שיש מספיק חלונות רצופים של 30 דקות
+ * כדי להכיל את כל משך השירות.
+ *
+ * לדוגמה:
+ * שירות של 60 דקות שמתחיל ב־09:00
+ * דורש שגם 09:00–09:30 וגם 09:30–10:00 יהיו פנויים.
+ */
+function hasContinuousAvailability({
+  candidateStartTime,
+  durationMinutes,
+  slots,
+}: {
+  candidateStartTime: string;
+  durationMinutes: number;
+  slots: AvailabilitySlotLike[];
+}) {
+  const requestedStart = toMinutes(candidateStartTime);
+  const requestedEnd = requestedStart + durationMinutes;
+
+  const sortedSlots = [...slots].sort(
+    (a, b) => toMinutes(a.start_time) - toMinutes(b.start_time)
+  );
+
+  let coveredUntil = requestedStart;
+
+  for (const slot of sortedSlots) {
+    if (slot.status !== "available") {
+      continue;
+    }
+
+    const slotStart = toMinutes(slot.start_time);
+    const slotEnd = toMinutes(slot.end_time);
+
+    if (slotEnd <= coveredUntil) {
+      continue;
+    }
+
+    /*
+     * אם יש רווח בין סוף החלון הקודם לחלון הנוכחי,
+     * אין רצף מלא עבור השירות.
+     */
+    if (slotStart > coveredUntil) {
+      break;
+    }
+
+    if (slotStart <= coveredUntil && slotEnd > coveredUntil) {
+      coveredUntil = slotEnd;
+    }
+
+    if (coveredUntil >= requestedEnd) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function overlapsExistingAppointment({
+  startTime,
+  durationMinutes,
+  appointments,
+}: {
+  startTime: string;
+  durationMinutes: number;
+  appointments: AppointmentLike[];
+}) {
+  const requestedStart = toMinutes(startTime);
+  const requestedEnd = requestedStart + durationMinutes;
+
+  return appointments.some((appointment) => {
+    const appointmentStart = toMinutes(appointment.start_time);
+    const appointmentEnd = toMinutes(appointment.end_time);
+
+    return overlaps(
+      requestedStart,
+      requestedEnd,
+      appointmentStart,
+      appointmentEnd
+    );
+  });
+}
+
+async function getService(
+  db: NonNullable<ReturnType<typeof createServerClient>>,
+  serviceName: string
+): Promise<ServiceLike | null> {
+  const { data, error } = await db
+    .from("services")
+    .select("id,duration_minutes")
+    .eq("name", serviceName)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Load booking service error:", error);
+    return null;
+  }
+
+  if (!data) {
+    return null;
+  }
+
+  return {
+    id: data.id,
+    duration_minutes: Number(data.duration_minutes),
+  };
 }
 
 export async function getBookingAvailability({
@@ -45,6 +163,7 @@ export async function getBookingAvailability({
   serviceName: string;
 }) {
   const db = createServerClient();
+
   if (!db) {
     return {
       date,
@@ -55,14 +174,9 @@ export async function getBookingAvailability({
     };
   }
 
-  const { data: service } = await db
-    .from("services")
-    .select("id,duration_minutes")
-    .eq("name", serviceName)
-    .eq("is_active", true)
-    .maybeSingle();
+  const service = await getService(db, serviceName);
 
-  if (!service) {
+  if (!service || service.duration_minutes <= 0) {
     return {
       date,
       slots: [] as string[],
@@ -72,50 +186,95 @@ export async function getBookingAvailability({
     };
   }
 
-  const { data: openSlots } = (await db
-    .from("open_slots")
-    .select("available_date,start_time")
-    .eq("available_date", date)
-    .order("start_time", { ascending: true })) as { data: OpenSlotLike[] | null };
+  const [
+    { data: availabilityData, error: availabilityError },
+    { data: appointmentsData, error: appointmentsError },
+  ] = await Promise.all([
+    db
+      .from("availability_slots")
+      .select("slot_date,start_time,end_time,status")
+      .eq("slot_date", date)
+      .order("start_time", { ascending: true }),
 
-  const { data: appointments } = (await db
-    .from("appointments")
-    .select("appointment_date,start_time,end_time")
-    .eq("appointment_date", date)
-    .not("status", "eq", "cancelled")) as { data: AppointmentLike[] | null };
+    db
+      .from("appointments")
+      .select("appointment_date,start_time,end_time,status")
+      .eq("appointment_date", date)
+      .neq("status", "cancelled")
+      .order("start_time", { ascending: true }),
+  ]);
 
-  const { data: blockedRows } = (await db
-    .from("blocked_times")
-    .select("blocked_date,start_time,end_time,is_full_day")
-    .eq("blocked_date", date)) as { data: BlockedTimeLike[] | null };
+  if (availabilityError) {
+    console.error(
+      "Load public availability slots error:",
+      availabilityError
+    );
 
-  const booked = appointments || [];
-  const blocked = blockedRows || [];
+    return {
+      date,
+      slots: [] as string[],
+      booked: [] as AppointmentLike[],
+      serviceId: service.id,
+      serviceDurationMinutes: service.duration_minutes,
+    };
+  }
 
-  const slots = (openSlots || []).filter((slot) => {
-    if (isPastSlot(slot.available_date, slot.start_time)) return false;
+  if (appointmentsError) {
+    console.error(
+      "Load public appointments error:",
+      appointmentsError
+    );
 
-    const slotStart = toMinutes(slot.start_time);
-    const slotEnd = slotStart + service.duration_minutes;
+    return {
+      date,
+      slots: [] as string[],
+      booked: [] as AppointmentLike[],
+      serviceId: service.id,
+      serviceDurationMinutes: service.duration_minutes,
+    };
+  }
 
-    const overlapsBlocked = blocked.some((block) => {
-      if (block.is_full_day) return true;
-      if (!block.start_time || !block.end_time) return false;
-      const blockStart = toMinutes(block.start_time);
-      const blockEnd = toMinutes(block.end_time);
-      return overlaps(slotStart, slotEnd, blockStart, blockEnd);
-    });
+  const availabilitySlots: AvailabilitySlotLike[] = (
+    availabilityData || []
+  ).map((slot) => ({
+    slot_date: slot.slot_date,
+    start_time: normalizeTime(slot.start_time),
+    end_time: normalizeTime(slot.end_time),
+    status: slot.status,
+  }));
 
-    if (overlapsBlocked) return false;
+  const booked: AppointmentLike[] = (appointmentsData || []).map(
+    (appointment) => ({
+      appointment_date: appointment.appointment_date,
+      start_time: normalizeTime(appointment.start_time),
+      end_time: normalizeTime(appointment.end_time),
+      status: appointment.status,
+    })
+  );
 
-    const overlapsAppointment = booked.some((appointment) => {
-      const appointmentStart = toMinutes(appointment.start_time);
-      const appointmentEnd = toMinutes(appointment.end_time);
-      return overlaps(slotStart, slotEnd, appointmentStart, appointmentEnd);
-    });
-
-    return !overlapsAppointment;
-  }).map((slot) => slot.start_time);
+  /*
+   * רק חלונות שהמנהל פרסם כ־available
+   * יכולים לשמש כשעת התחלה אפשרית.
+   */
+  const slots = availabilitySlots
+    .filter((slot) => slot.status === "available")
+    .filter((slot) => !isPastSlot(date, slot.start_time))
+    .filter((slot) =>
+      hasContinuousAvailability({
+        candidateStartTime: slot.start_time,
+        durationMinutes: service.duration_minutes,
+        slots: availabilitySlots,
+      })
+    )
+    .filter(
+      (slot) =>
+        !overlapsExistingAppointment({
+          startTime: slot.start_time,
+          durationMinutes: service.duration_minutes,
+          appointments: booked,
+        })
+    )
+    .map((slot) => normalizeTime(slot.start_time));
 
   return {
     date,
@@ -134,6 +293,7 @@ export async function getAvailableDatesForMonth({
   serviceName: string;
 }) {
   const db = createServerClient();
+
   if (!db) {
     return {
       month,
@@ -142,97 +302,168 @@ export async function getAvailableDatesForMonth({
   }
 
   const [year, monthIndex] = month.split("-").map(Number);
-  if (!year || !monthIndex) {
+
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(monthIndex) ||
+    monthIndex < 1 ||
+    monthIndex > 12
+  ) {
     return {
       month,
       availableDates: [] as string[],
     };
   }
 
-  const startDate = new Date(Date.UTC(year, monthIndex - 1, 1));
   const endDate = new Date(Date.UTC(year, monthIndex, 0));
-  const from = `${year}-${String(monthIndex).padStart(2, "0")}-01`;
-  const to = `${year}-${String(monthIndex).padStart(2, "0")}-${String(endDate.getUTCDate()).padStart(2, "0")}`;
 
-  const { data: service } = await db
-    .from("services")
-    .select("id,duration_minutes")
-    .eq("name", serviceName)
-    .eq("is_active", true)
-    .maybeSingle();
+  const from =
+    `${year}-` +
+    `${String(monthIndex).padStart(2, "0")}-01`;
 
-  if (!service) {
+  const to =
+    `${year}-` +
+    `${String(monthIndex).padStart(2, "0")}-` +
+    `${String(endDate.getUTCDate()).padStart(2, "0")}`;
+
+  const service = await getService(db, serviceName);
+
+  if (!service || service.duration_minutes <= 0) {
     return {
       month,
       availableDates: [] as string[],
     };
   }
 
-  const { data: openSlots } = (await db
-    .from("open_slots")
-    .select("available_date,start_time")
-    .gte("available_date", from)
-    .lte("available_date", to)
-    .order("available_date", { ascending: true })
-    .order("start_time", { ascending: true })) as { data: OpenSlotLike[] | null };
+  const [
+    { data: availabilityData, error: availabilityError },
+    { data: appointmentsData, error: appointmentsError },
+  ] = await Promise.all([
+    db
+      .from("availability_slots")
+      .select("slot_date,start_time,end_time,status")
+      .gte("slot_date", from)
+      .lte("slot_date", to)
+      .order("slot_date", { ascending: true })
+      .order("start_time", { ascending: true }),
 
-  const { data: appointments } = (await db
-    .from("appointments")
-    .select("appointment_date,start_time,end_time")
-    .gte("appointment_date", from)
-    .lte("appointment_date", to)
-    .not("status", "eq", "cancelled")) as { data: AppointmentLike[] | null };
+    db
+      .from("appointments")
+      .select("appointment_date,start_time,end_time,status")
+      .gte("appointment_date", from)
+      .lte("appointment_date", to)
+      .neq("status", "cancelled")
+      .order("appointment_date", { ascending: true })
+      .order("start_time", { ascending: true }),
+  ]);
 
-  const { data: blockedRows } = (await db
-    .from("blocked_times")
-    .select("blocked_date,start_time,end_time,is_full_day")
-    .gte("blocked_date", from)
-    .lte("blocked_date", to)) as { data: BlockedTimeLike[] | null };
+  if (availabilityError) {
+    console.error(
+      "Load monthly availability error:",
+      availabilityError
+    );
 
-  const blockedByDate = (blockedRows || []).reduce<Record<string, BlockedTimeLike[]>>((acc, block) => {
-    acc[block.blocked_date] = [...(acc[block.blocked_date] || []), block];
-    return acc;
-  }, {});
+    return {
+      month,
+      availableDates: [] as string[],
+    };
+  }
 
-  const bookedByDate = (appointments || []).reduce<Record<string, AppointmentLike[]>>((acc, appointment) => {
-    acc[appointment.appointment_date] = [...(acc[appointment.appointment_date] || []), appointment];
-    return acc;
-  }, {});
+  if (appointmentsError) {
+    console.error(
+      "Load monthly appointments error:",
+      appointmentsError
+    );
 
-  const availableDates = new Set<string>();
-  const today = new Date();
+    return {
+      month,
+      availableDates: [] as string[],
+    };
+  }
 
-  (openSlots || []).forEach((slot) => {
-    const availableDate = slot.available_date;
-    const slotDate = new Date(`${availableDate}T${slot.start_time}:00`);
-    if (slotDate.getTime() <= today.getTime()) return;
+  const availabilityByDate = (
+    (availabilityData || []) as AvailabilitySlotLike[]
+  ).reduce<Record<string, AvailabilitySlotLike[]>>(
+    (result, slot) => {
+      const normalizedSlot: AvailabilitySlotLike = {
+        slot_date: slot.slot_date,
+        start_time: normalizeTime(slot.start_time),
+        end_time: normalizeTime(slot.end_time),
+        status: slot.status,
+      };
 
-    const slotStart = toMinutes(slot.start_time);
-    const slotEnd = slotStart + service.duration_minutes;
+      result[slot.slot_date] = [
+        ...(result[slot.slot_date] || []),
+        normalizedSlot,
+      ];
 
-    const blocked = blockedByDate[availableDate] || [];
-    const overlapsBlocked = blocked.some((block) => {
-      if (block.is_full_day) return true;
-      if (!block.start_time || !block.end_time) return false;
-      const blockStart = toMinutes(block.start_time);
-      const blockEnd = toMinutes(block.end_time);
-      return overlaps(slotStart, slotEnd, blockStart, blockEnd);
-    });
-    if (overlapsBlocked) return;
+      return result;
+    },
+    {}
+  );
 
-    const appointmentsForDate = bookedByDate[availableDate] || [];
-    const overlapsAppointment = appointmentsForDate.some((appointment) => {
-      const appointmentStart = toMinutes(appointment.start_time);
-      const appointmentEnd = toMinutes(appointment.end_time);
-      return overlaps(slotStart, slotEnd, appointmentStart, appointmentEnd);
-    });
-    if (overlapsAppointment) return;
+  const appointmentsByDate = (
+    (appointmentsData || []) as AppointmentLike[]
+  ).reduce<Record<string, AppointmentLike[]>>(
+    (result, appointment) => {
+      const normalizedAppointment: AppointmentLike = {
+        appointment_date: appointment.appointment_date,
+        start_time: normalizeTime(appointment.start_time),
+        end_time: normalizeTime(appointment.end_time),
+        status: appointment.status,
+      };
 
-    availableDates.add(availableDate);
-  });
+      result[appointment.appointment_date] = [
+        ...(result[appointment.appointment_date] || []),
+        normalizedAppointment,
+      ];
+
+      return result;
+    },
+    {}
+  );
+
+  const availableDates: string[] = [];
+
+  for (const [date, dateSlots] of Object.entries(
+    availabilityByDate
+  )) {
+    const appointmentsForDate = appointmentsByDate[date] || [];
+
+    const hasAvailableStartTime = dateSlots
+      .filter((slot) => slot.status === "available")
+      .some((slot) => {
+        if (isPastSlot(date, slot.start_time)) {
+          return false;
+        }
+
+        const hasEnoughContinuousTime =
+          hasContinuousAvailability({
+            candidateStartTime: slot.start_time,
+            durationMinutes: service.duration_minutes,
+            slots: dateSlots,
+          });
+
+        if (!hasEnoughContinuousTime) {
+          return false;
+        }
+
+        return !overlapsExistingAppointment({
+          startTime: slot.start_time,
+          durationMinutes: service.duration_minutes,
+          appointments: appointmentsForDate,
+        });
+      });
+
+    if (hasAvailableStartTime) {
+      availableDates.push(date);
+    }
+  }
+
+  availableDates.sort();
 
   return {
     month,
-    availableDates: [...availableDates],
+    availableDates,
   };
 }
